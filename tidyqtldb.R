@@ -7,7 +7,7 @@ qtl_bed <- "QTLdb_pigSS11.bed"
 qtl_gff <- "QTLdb_pigSS11.gff"
 chr_include <- 1:18
 
-type <- "qtldb_fuzzy" ## c("qtldb", "qtldb_hard", "qtldb_fuzzy")
+type <- "qtldb" ## c("qtldb", "qtldb_hard", "qtldb_fuzzy")
 trait_level <- 2 ## c(1, 2)
 min_snps <- 400
 remove_cM <- TRUE
@@ -112,7 +112,8 @@ if(trait_level == 2) {
 
     trait_cat_subcat <- data.frame(trait_cat=character(0),
                                    trait_subcat = character(0),
-                                   trait_type = character(0))
+                                   trait_type = character(0),
+                                   trait_type_code = character(0))
     for(i in category_indices) {
         tmp <- lapply(list(unlist(strsplit(web[i], "-->"))[-1]),
                       function(x) {strsplit(x, "\n")})
@@ -124,12 +125,28 @@ if(trait_level == 2) {
                           trait_type =
                               unlist(lapply(strsplit(x[-1], split=" { ",
                                                      fixed=TRUE),
-                                            function(x) x[1])))}) %>%
+                                            function(y) y[1])),
+                          trait_type_code =
+                              unlist(lapply(strsplit(x[-1], split=" { ",
+                                                     fixed=TRUE),
+                                            function(y) y[2])) %>%
+                              unlist(lapply(strsplit(., split = " }",
+                                                     fixed=TRUE),
+                                            function(yy) yy[1]))
+                          )}) %>%
             bind_rows() %>%
-            filter(!grepl("^<!--",trait_type))
+            filter(!grepl("^<!--",trait_type)) %>%
+            separate(trait_type_code, sep= " ",
+                     into = c("trait_type_code", "misc")) %>%
+            select(-misc)
 
         trait_cat_subcat <- bind_rows(trait_cat_subcat, subcat)
     }
+    trait_cat_subcat_code <- trait_cat_subcat %>%
+        separate(trait_cat, sep = " Traits",
+                 into = c("trait_cat", "tmp")) %>% select(-tmp) %>%
+        mutate(trait_cat = gsub(" ", "_", trait_cat))
+    trait_cat_subcat <- trait_cat_subcat %>% select(-trait_type_code)
 
     ## => collapsing all QTL/eQTL/association into intermediate trait categories
     ## Two outliers Litter weight, total {birth}, Litter weight, total {weaning}
@@ -198,6 +215,121 @@ annot <- annot %>%
     dplyr::select(seqnames, start, end, snp, everything())
 colnames(annot) <- gsub(" ", "_", colnames(annot))
 
+
+## Identify P-values -----------------------------------------------------------
+## P-value (=>): 27460
+## F-Stat: 5274
+## Variance (value , %): 6360
+## Dominance_Effect: 3678
+## Additive_Effect: 5144
+## LOD-score: 1627
+## Bayes-value: 283
+## Likelihood_Ratio: 884
+qtldb_bed <- read.table(qtl_bed, skip=20, sep="\t")
+qtldb_pval <- read.table(qtl_gff, skip=21, sep="\t")
+## Check that bed and gff are in the same order
+all.equal(strsplit(qtldb_bed$V4, "(", fixed=TRUE)  %>%
+              lapply(.,function(x) x[length(x)]) %>% unlist() %>%
+              strsplit(., ")", fixed=TRUE) %>% unlist(),
+          strsplit(qtldb_pval$V9, ";", fixed=TRUE) %>%
+              lapply(.,function(x) x[1]) %>% unlist() %>%
+              strsplit(., "=", fixed=TRUE) %>%
+              lapply(., function(x) x[2]) %>% unlist())
+
+colnames(qtldb_pval)[c(3,9)] <- c("trait_cat", "info")
+qtldb_pval <- qtldb_pval %>% select(trait_cat, info)
+qtldb_pval$trait <- qtldb_pval$Pvalue <- qtldb_pval$trait_type_code <- NULL
+colnames(qtldb_bed)[1:3] <- c("seqnames", "start", "end")
+qtldb_bed <- qtldb_bed %>%
+    separate(seqnames, into=c("chr", "seqnames")) %>%
+    select(seqnames, start, end) %>%
+    mutate(seqnames = as.character(seqnames))
+
+## Add positions from bed file to p-value information
+qtldb_pval <- cbind(qtldb_bed, qtldb_pval)
+qtldb_pval <- qtldb_pval %>%
+    filter(seqnames %in% chr_include) %>%
+    na.omit()
+
+## Some end coordinates are before start coordinates
+switch_index <- which(qtldb_pval$end < qtldb_pval$start)
+qtldb_pval[switch_index, c(2:3)] <- qtldb_pval[switch_index, c(3:2)]
+
+## Remove any QTLs measured in cM
+if(remove_cM) {
+    qtldb_pval <- qtldb_pval[which(qtldb_pval$end - qtldb_pval$start < 100),]
+}
+
+## Define QTLs using a padding window, if desired
+if(!is.null(qtldb_padding)) {
+    qtldb_pval$start <- qtldb_pval$start - qtldb_padding
+    qtldb_pval$end <- qtldb_pval$end + qtldb_padding
+    qtldb_pval$start <- ifelse(qtldb_pval$start < 0, 0, qtldb_pval$start)
+}
+
+## Fill in p-values
+for(i in 1:nrow(qtldb_pval)) {
+    tmp <- unlist(strsplit(qtldb_pval$info[i], split = ";"))
+    qtldb_pval$trait[i] <- unlist(strsplit(tmp[grep("trait=", tmp)],
+                                             split="="))[2]
+    qtldb_pval$Pvalue[i] <-
+        ifelse(length(grep("P-value=", tmp)),
+               unlist(strsplit(tmp[grep("P-value=", tmp)],split="="))[2],
+               NA)
+    qtldb_pval$trait_type_code[i] <- unlist(strsplit(tmp[grep("Abbrev=", tmp)],
+                                                     split="="))[2]
+
+}
+write.table(qtldb_pval %>%
+                select(seqnames, start, end, trait_cat,
+                       trait_type_code, trait, Pvalue, info),
+            file=paste0("annotation_level-", trait_level, "_pvalues.txt"),
+            quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t")
+
+sum(!is.na(qtldb_pval$Pvalue)) ## 18309 SNPs with p-values
+sum(grepl("<", qtldb_pval$Pvalue)) ## of which 11926 have "<" => Syggestive!
+table(qtldb_pval$Pvalue[grepl("<", qtldb_pval$Pvalue)]) %>% sort()
+
+qtldb_pval_exact <- qtldb_pval %>%
+    select(-info) %>%
+    mutate(Pvalue = gsub("<", "", Pvalue)) %>%
+    mutate(Pvalue = as.numeric(Pvalue)) %>%
+    separate(trait_cat, into = c("trait_cat", "type"), sep = "_QTL",
+         extra = "drop", fill = "right") %>%
+    separate(trait_cat, into = c("trait_cat", "type2"), sep = "_Association",
+             extra = "drop", fill = "right") %>%
+    separate(trait_cat, into = c("trait_cat", "type3"), sep = "_eQTL",
+             extra = "drop", fill = "right") %>%
+    select(-type, -type2, -type3) %>%
+    rename(trait_type = trait) %>%
+    select(seqnames, start, end, trait_cat, trait_type, trait_type_code,
+           Pvalue) %>%
+    left_join(., unique(select(trait_cat_subcat_code, -trait_type)),
+              by = c("trait_cat", "trait_type_code")) %>%
+    select(seqnames, start, end, trait_cat, trait_subcat,
+           trait_type_code, trait_type, Pvalue) %>%
+    na.omit() %>%
+    mutate(end = start + 3, start = start + 2)
+
+
+write.table(qtldb_pval_exact,
+            file=paste0("annotation_level-", trait_level, "_pvalues_exact.txt"),
+            quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t")
+
+qtldb_pval_exact_simplify <- qtldb_pval_exact %>%
+    select(-trait_type_code, -trait_type) %>%
+    group_by(seqnames, start, end, trait_cat, trait_subcat) %>%
+    summarise(min_Pvalue = min(Pvalue)) %>%
+    ungroup()
+
+write.table(qtldb_pval_exact_simplify,
+            file=paste0("annotation_level-", trait_level,
+                        "_pvalues_exact_simplify.txt"),
+            quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t")
+
+
+
+## Extend to fuzzy and hard windows --------------------------------------------
 if(type != "qtldb") {
     ## Fuzzy windows
     annot_reorder <- annot %>% arrange(seqnames, start, end)
@@ -230,6 +362,7 @@ if(type != "qtldb") {
     colnames(annot_subcat_hardwindow) <-
         gsub(" ", "_", colnames(annot_subcat_hardwindow))
 }
+
 
 ## Write out final results
 if(type == "qtldb") annot_final <- annot
